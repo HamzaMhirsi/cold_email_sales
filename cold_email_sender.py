@@ -13,6 +13,7 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from dotenv import load_dotenv
 from email_template import get_email_template, get_follow_up_template
+from language_mapping import detect_language_from_csv_row
 
 # Load environment variables
 load_dotenv()
@@ -104,7 +105,7 @@ class ColdEmailSender:
             return False
     
     def load_contacts(self, csv_file_path):
-        """Load contacts from CSV file"""
+        """Load contacts from CSV file with language detection"""
         contacts = []
         try:
             with open(csv_file_path, 'r', encoding='utf-8') as file:
@@ -112,6 +113,10 @@ class ColdEmailSender:
                 for row in reader:
                     email = self.extract_email_from_row(row)
                     if email:
+                        # Convert row to list for language detection
+                        row_list = [row.get(field, '') for field in reader.fieldnames]
+                        detected_language = detect_language_from_csv_row(row_list)
+                        
                         contact = {
                             'first_name': row.get('First Name', '').strip(),
                             'last_name': row.get('Last Name', '').strip(),
@@ -120,7 +125,8 @@ class ColdEmailSender:
                             'job_title': row.get('Job Title', '').strip(),
                             'location': row.get('Location', '').strip(),
                             'linkedin': row.get('LinkedIn Profile', '').strip(),
-                            'email': email
+                            'email': email,
+                            'language': detected_language
                         }
                         contacts.append(contact)
             
@@ -164,7 +170,8 @@ class ColdEmailSender:
                     first_name=first_name,
                     company_name=contact['company_name'],
                     job_title=contact['job_title'],
-                    booking_link=self.booking_link
+                    booking_link=self.booking_link,
+                    language=contact['language']
                 )
                 
                 success = self.send_email(
@@ -207,7 +214,8 @@ class ColdEmailSender:
                 first_name=first_name,
                 company_name=contact['company_name'],
                 job_title=contact['job_title'],
-                booking_link=self.booking_link
+                booking_link=self.booking_link,
+                language=contact['language']
             )
             
             print(f"--- Contact {i+1}: {contact['full_name']} ({contact['email']}) ---")
