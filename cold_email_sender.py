@@ -14,6 +14,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from email_template import get_email_template, get_follow_up_template
 from language_mapping import detect_language_from_csv_row
+from campaign_tracker import CampaignTracker
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +41,9 @@ class ColdEmailSender:
         self.booking_link = os.getenv('BOOKING_LINK', 'https://calendly.com/your-booking-link')
         self.delay_between_emails = int(os.getenv('DELAY_BETWEEN_EMAILS', 5))
         self.max_emails_per_day = int(os.getenv('MAX_EMAILS_PER_DAY', 50))
+        
+        # Initialize campaign tracker
+        self.tracker = CampaignTracker()
         
         # Validate required environment variables
         if not all([self.email_user, self.email_password, self.from_email]):
@@ -101,8 +105,20 @@ class ColdEmailSender:
             return True
             
         except Exception as e:
+            error_msg = str(e)
             logging.error(f"Failed to send email to {contact_name} ({to_email}): {e}")
-            return False
+            
+            # Check if it's a rate limiting error
+            if "5.4.6" in error_msg and "Unusual sending activity" in error_msg:
+                logging.warning("Rate limiting detected - Zoho is blocking bulk emails")
+                return False, "rate_limit"
+            
+            # Check if it's a connection error
+            if "please run connect() first" in error_msg or "Server not connected" in error_msg:
+                logging.warning("SMTP connection lost - needs reconnection")
+                return False, "connection_lost"
+                
+            return False, "other_error"
     
     def load_contacts(self, csv_file_path):
         """Load contacts from CSV file with language detection"""
@@ -148,12 +164,26 @@ class ColdEmailSender:
             logging.warning(f"Start index {start_index} is beyond the number of contacts ({len(contacts)})")
             return
         
-        # Limit contacts to send to
-        end_index = min(start_index + max_emails, len(contacts))
-        contacts_to_email = contacts[start_index:end_index]
+        # Filter out contacts already contacted
+        contacts_to_process = []
+        skipped_count = 0
+        
+        for contact in contacts[start_index:]:
+            existing_contact = self.tracker.get_contact_by_email(contact['email'])
+            if existing_contact and existing_contact['initial_email_sent'] == 'True':
+                skipped_count += 1
+                logging.info(f"Skipping already contacted: {contact['email']}")
+                continue
+            contacts_to_process.append(contact)
+            
+            # Stop when we have enough contacts to email
+            if len(contacts_to_process) >= max_emails:
+                break
+        
+        contacts_to_email = contacts_to_process
         
         mode_text = "[TEST MODE] " if test_mode else ""
-        logging.info(f"{mode_text}Starting email campaign: sending to {len(contacts_to_email)} contacts (index {start_index} to {end_index-1})")
+        logging.info(f"{mode_text}Starting email campaign: sending to {len(contacts_to_email)} contacts (skipped {skipped_count} already contacted)")
         
         server = None
         if not test_mode:
@@ -163,6 +193,9 @@ class ColdEmailSender:
         failed_count = 0
         
         try:
+            rate_limit_count = 0
+            max_rate_limit_retries = 3
+            
             for i, contact in enumerate(contacts_to_email, start=start_index):
                 first_name = contact['first_name'] or contact['full_name'].split()[0] if contact['full_name'] else 'there'
                 
@@ -174,23 +207,69 @@ class ColdEmailSender:
                     language=contact['language']
                 )
                 
-                success = self.send_email(
-                    server=server,
-                    to_email=contact['email'],
-                    subject=subject,
-                    html_body=html_body,
-                    text_body=text_body,
-                    contact_name=contact['full_name'] or f"{contact['first_name']} {contact['last_name']}",
-                    test_mode=test_mode
-                )
-                
-                if success:
-                    sent_count += 1
-                else:
-                    failed_count += 1
+                # Attempt to send email with retry logic
+                max_retries = 2
+                for attempt in range(max_retries):
+                    result = self.send_email(
+                        server=server,
+                        to_email=contact['email'],
+                        subject=subject,
+                        html_body=html_body,
+                        text_body=text_body,
+                        contact_name=contact['full_name'] or f"{contact['first_name']} {contact['last_name']}",
+                        test_mode=test_mode
+                    )
+                    
+                    # Handle different result formats (backward compatibility)
+                    if isinstance(result, tuple):
+                        success, error_type = result
+                    else:
+                        success = result
+                        error_type = "other_error" if not success else None
+                    
+                    if success:
+                        sent_count += 1
+                        # Log to campaign tracker (only if not test mode)
+                        if not test_mode:
+                            self.tracker.log_initial_email(contact, subject, contact['language'])
+                            logging.info(f"Logged email to campaign tracker: {contact['email']}")
+                        break
+                    
+                    elif error_type == "rate_limit":
+                        rate_limit_count += 1
+                        if rate_limit_count >= max_rate_limit_retries:
+                            logging.error("Too many rate limit errors. Stopping campaign to avoid account suspension.")
+                            logging.error("Consider using a different SMTP provider or reducing send rate.")
+                            return
+                        
+                        logging.warning(f"Rate limit hit. Waiting 60 seconds before continuing...")
+                        time.sleep(60)
+                        failed_count += 1
+                        break  # Don't retry this email, move to next
+                    
+                    elif error_type == "connection_lost" and attempt < max_retries - 1:
+                        logging.info("Attempting to reconnect to SMTP server...")
+                        try:
+                            if server:
+                                server.quit()
+                        except:
+                            pass
+                        
+                        server = self.connect_to_smtp()
+                        if not server:
+                            logging.error("Failed to reconnect to SMTP server")
+                            failed_count += 1
+                            break
+                        
+                        logging.info("Reconnected successfully, retrying email...")
+                        time.sleep(2)  # Brief pause before retry
+                    
+                    else:
+                        failed_count += 1
+                        break  # Don't retry for other errors
                 
                 # Add delay between emails to avoid being flagged as spam
-                if i < end_index - 1:  # Don't delay after the last email
+                if i < len(contacts_to_email) - 1:  # Don't delay after the last email
                     delay_time = 1 if test_mode else self.delay_between_emails
                     logging.info(f"Waiting {delay_time} seconds before next email...")
                     time.sleep(delay_time)
@@ -199,7 +278,11 @@ class ColdEmailSender:
             if server:
                 server.quit()
             logging.info(f"{mode_text}Campaign completed. Sent: {sent_count}, Failed: {failed_count}")
-            logging.info(f"Next batch should start from index: {end_index}")
+            logging.info(f"Skipped {skipped_count} already contacted contacts")
+            
+            # Print campaign statistics
+            if not test_mode and sent_count > 0:
+                self.tracker.print_campaign_stats()
     
     def preview_emails(self, csv_file_path, count=5):
         """Preview email templates for the first few contacts"""
@@ -234,13 +317,19 @@ def main():
     parser.add_argument('--start', type=int, default=0, help='Start index for contacts (default: 0)')
     parser.add_argument('--max', type=int, help='Maximum number of emails to send (default: from env)')
     parser.add_argument('--preview-count', type=int, default=5, help='Number of emails to preview (default: 5)')
+    parser.add_argument('--stats', action='store_true', help='Show campaign statistics')
+    parser.add_argument('--follow-up', type=int, choices=[1,2,3], help='Send follow-up emails (1, 2, or 3)')
     
     args = parser.parse_args()
     
     try:
         sender = ColdEmailSender()
         
-        if args.preview:
+        if args.stats:
+            sender.tracker.print_campaign_stats()
+        elif args.follow_up:
+            sender.send_follow_up_campaign(args.follow_up)
+        elif args.preview:
             sender.preview_emails(args.csv, args.preview_count)
         elif args.test:
             sender.send_campaign(args.csv, args.start, args.max, test_mode=True)
